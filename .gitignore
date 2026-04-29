@@ -1,0 +1,40 @@
+# Private build source and local build workspace files
+setup_wizard.ps1
+controller_watch.ps1
+build_wizard_exe.ps1
+PRE_RELEASE_TESTING.md
+GITHUB_RELEASE_NOTES_TEMPLATE.md
+SofaShift.ico
+SofaShift.jpeg
+SofaShift-GitHub-Banner.png
+
+# Generated runtime files
+config.psd1
+config.ps1
+controller_watch.log
+controller_watch.log.old
+SofaShift_debug.log
+launch_controller_watch_hidden.vbs
+launch_monitorswitcher_hidden.vbs
+uninstall_sofashift.ps1
+uninstall_sofashift.cmd
+
+# Release/build outputs
+SofaShift-Setup.exe
+*.exe
+*.zip
+*.7z
+*.msi
+*.nupkg
+
+# Private QA and bundled tools
+ui-qa/
+output/
+nircmd/
+FRLToggle/
+tools/
+
+# Local scratch
+*.tmp
+*.bak
+*.old
