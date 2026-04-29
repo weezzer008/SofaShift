@@ -3971,13 +3971,37 @@ function Write-UninstallScripts {
     $cmdPath = Join-Path $AppDir "uninstall_sofashift.cmd"
 
 $psContent = @'
-$ErrorActionPreference = "Continue"
+param(
+    [switch]$Elevated
+)
 
-# SofaShift installs per-user assets, so uninstall runs without elevation.
+$ErrorActionPreference = "Continue"
 
 function Write-UninstallLog {
     param([string]$Msg)
     Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')  $Msg"
+}
+
+function Test-UninstallAdmin {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+function Get-CurrentPowerShellExe {
+    try {
+        $p = Get-Process -Id $PID -ErrorAction Stop
+        if ($p.Path) { return [string]$p.Path }
+    } catch {}
+    try {
+        $cmd = Get-Command powershell.exe -ErrorAction Stop
+        if ($cmd.Source) { return [string]$cmd.Source }
+    } catch {}
+    return "powershell.exe"
 }
 
 $AppDir       = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -3987,15 +4011,55 @@ $TrayLauncher  = Join-Path $AppDir "launch_monitorswitcher_hidden.vbs"
 
 Write-UninstallLog "Starting SofaShift uninstall from $AppDir"
 
+# The startup task runs with RunLevel Highest so FRL Toggle can write driver settings.
+# Removing that task may require elevation; relaunch once with UAC, then continue
+# best-effort if the user cancels the prompt.
+if (-not $Elevated -and -not (Test-UninstallAdmin)) {
+    try {
+        $self = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+        $psExe = Get-CurrentPowerShellExe
+        $argList = @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", "`"$self`"",
+            "-Elevated"
+        )
+        Write-UninstallLog "Requesting elevation so the scheduled task can be removed"
+        $p = Start-Process -FilePath $psExe -ArgumentList $argList -Verb RunAs -Wait -PassThru -ErrorAction Stop
+        Write-UninstallLog "Elevated uninstall finished with exit code $($p.ExitCode)"
+        exit $p.ExitCode
+    } catch {
+        Write-UninstallLog "Elevation was not completed; continuing without elevation: $($_.Exception.Message)"
+    }
+}
+
 # -- Scheduled task: remove only SofaShift's per-user monitor task ------------
 try {
-    $task = Get-ScheduledTask -TaskName 'SofaShift Monitor' -ErrorAction SilentlyContinue
-    if ($task) {
-        Unregister-ScheduledTask -TaskName 'SofaShift Monitor' -Confirm:$false -ErrorAction Stop
-        Write-UninstallLog "Removed scheduled task: SofaShift Monitor"
+    $tasks = @(Get-ScheduledTask -TaskName 'SofaShift Monitor' -ErrorAction SilentlyContinue)
+    foreach ($task in $tasks) {
+        $taskPath = if ($task.TaskPath) { [string]$task.TaskPath } else { '\' }
+        Unregister-ScheduledTask -TaskName 'SofaShift Monitor' -TaskPath $taskPath -Confirm:$false -ErrorAction Stop
+        Write-UninstallLog ("Removed scheduled task: {0}SofaShift Monitor" -f $taskPath)
     }
 } catch {
     Write-UninstallLog ("Failed removing scheduled task: {0}" -f $_.Exception.Message)
+}
+
+try {
+    $remainingTask = Get-ScheduledTask -TaskName 'SofaShift Monitor' -ErrorAction SilentlyContinue
+    if ($remainingTask) {
+        $schtasks = Join-Path $env:SystemRoot "System32\schtasks.exe"
+        if (Test-Path -LiteralPath $schtasks -PathType Leaf) {
+            & $schtasks /Delete /TN "\SofaShift Monitor" /F | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-UninstallLog "Removed scheduled task with schtasks fallback: SofaShift Monitor"
+            } else {
+                Write-UninstallLog "schtasks fallback returned exit code $LASTEXITCODE"
+            }
+        }
+    }
+} catch {
+    Write-UninstallLog ("Scheduled task fallback failed: {0}" -f $_.Exception.Message)
 }
 
 # -- Stop running watcher / launcher processes --------------------------------
@@ -4636,14 +4700,6 @@ function Build-ProfileGroup ([System.Windows.Forms.Panel]$Parent, [int]$Idx, [in
     if (-not $displayDefault -and $hasNative -and $prof.Friendly) {
         $displayDefault = [string]$prof.Friendly
     }
-    if ($hasNative) {
-        $savedDisplay = @($displayItems | Where-Object {
-            ($prof.DevicePath -and $_.DeviceId -and ([string]$_.DeviceId -eq [string]$prof.DevicePath)) -or
-            (([uint32]$_.TargetId -eq [uint32]$prof.TargetId) -and ([uint32]$_.AdapterLow -eq [uint32]$prof.AdapterLow) -and ([int]$_.AdapterHigh -eq [int]$prof.AdapterHigh)) -or
-            ($prof.Friendly -and $_.Friendly -and ([string]$_.Friendly -eq [string]$prof.Friendly))
-        } | Select-Object -First 1)
-        if ($savedDisplay) { $displayDefault = [string]$savedDisplay[0].Label }
-    }
     if (-not $displayDefault) {
         if ($Idx -lt @($displayItems).Count) {
             $displayDefault = [string]$displayItems[$Idx].Label
@@ -5075,9 +5131,9 @@ function Build-P2 {
     Set-WrapLabelHeight $profileIntro 72
     $p.Controls.Add($profileIntro)
 
-    $p.Controls.Add((New-Lbl "Number of displays:" 28 124 210 28 $fBody $cText))
+    $p.Controls.Add((New-Lbl "Number of displays:" 28 132 210 28 $fBody $cText))
     $countSpin = New-Object System.Windows.Forms.NumericUpDown
-    $countSpin.Location=[Drawing.Point]::new(244,121); $countSpin.Size=[Drawing.Size]::new(58,26)
+    $countSpin.Location=[Drawing.Point]::new(244,129); $countSpin.Size=[Drawing.Size]::new(58,26)
     if ($script:W.ProfileCount -lt $script:W.Profiles.Count) {
         $script:W['ProfileCount'] = [Math]::Min($script:W.Profiles.Count, 4)
     }
@@ -5085,24 +5141,24 @@ function Build-P2 {
     $countSpin.Font=$fBody; $countSpin.BackColor=$cLight; $countSpin.ForeColor=$cText
     $p.Controls.Add($countSpin)
 
-    $addProfileBtn = New-GhostBtn "Add profile" 326 116 136 38
+    $addProfileBtn = New-GhostBtn "Add profile" 326 126 136 36
     Set-ControlToolTip $addProfileBtn "Adds one more display profile slot, up to four."
     Set-ButtonTextFit $addProfileBtn
     $p.Controls.Add($addProfileBtn)
 
-    $refreshDisplaysBtn = New-GhostBtn "Refresh displays" 480 116 160 38
+    $refreshDisplaysBtn = New-GhostBtn "Refresh displays" 480 126 160 36
     Set-ControlToolTip $refreshDisplaysBtn "Re-checks the live Windows display list after HDMI, HDFury, or projector changes."
     Set-ButtonTextFit $refreshDisplaysBtn
     $p.Controls.Add($refreshDisplaysBtn)
 
     # Tip about "Restore on disconnect"
     $tip = New-Lbl "$([char]0x2139)  Check 'Restore on disconnect' on the profile that represents your main PC display." `
-        28 158 660 38 $fSmall $cMuted
+        28 172 660 34 $fSmall $cMuted
     Set-WrapLabelHeight $tip 52
     $p.Controls.Add($tip)
 
     $scroll = New-Object System.Windows.Forms.Panel
-    $scroll.Location=[Drawing.Point]::new(8,204); $scroll.Size=[Drawing.Size]::new(700,526)
+    $scroll.Location=[Drawing.Point]::new(8,214); $scroll.Size=[Drawing.Size]::new(700,516)
     $scroll.AutoScroll=$true; $scroll.BackColor=$cContent
     $scroll.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
     $p.Controls.Add($scroll)
@@ -5330,9 +5386,15 @@ function Sync-ProfileData {
                             $ctrl.HzCombo.SelectedItem  } else { $ctrl.HzCombo.Text.Trim() }
         $pr.Audio     = $(if ($ctrl.AudioCombo.SelectedItem) { $ctrl.AudioCombo.SelectedItem } else { $ctrl.AudioCombo.Text.Trim() })
         if ($ctrl.DisplayCombo) {
-            $tdVal = if ($ctrl.DisplayCombo.SelectedItem) { [string]$ctrl.DisplayCombo.SelectedItem } else { [string]$ctrl.DisplayCombo.Text.Trim() }
-            try { $pr.TargetDisplay = $tdVal }
-            catch { $pr | Add-Member -NotePropertyName 'TargetDisplay' -NotePropertyValue $tdVal -Force }
+            $isSavedNative = ($pr.NativeSaved -or ([uint32]$pr.TargetId -gt 0))
+            if (-not $isSavedNative) {
+                $tdVal = if ($ctrl.DisplayCombo.SelectedItem) { [string]$ctrl.DisplayCombo.SelectedItem } else { [string]$ctrl.DisplayCombo.Text.Trim() }
+                try { $pr.TargetDisplay = $tdVal }
+                catch { $pr | Add-Member -NotePropertyName 'TargetDisplay' -NotePropertyValue $tdVal -Force }
+            } elseif (-not $pr.TargetDisplay -and $pr.Friendly) {
+                try { $pr.TargetDisplay = [string]$pr.Friendly }
+                catch { $pr | Add-Member -NotePropertyName 'TargetDisplay' -NotePropertyValue ([string]$pr.Friendly) -Force }
+            }
         }
         $pr.IsDesktop   = $ctrl.DeskChk.Checked
         if ($ctrl.PlayniteChk)  { $pr.UsePlaynite  = $ctrl.PlayniteChk.Checked }
@@ -5357,9 +5419,33 @@ function Sync-ProfileData {
     }
 }
 
-# Check that at least one profile has a saved XML path
+# Check that every active profile has a native CCD target saved.
 function Test-ProfilesSaved {
-    ($script:W.Profiles | Where-Object { $_.NativeSaved -or ([uint32]$_.TargetId -gt 0) }).Count -gt 0
+    $max = [Math]::Min([int]$script:W.ProfileCount, [int]$script:W.Profiles.Count)
+    if ($max -le 0) { return $false }
+    for ($i=0; $i -lt $max; $i++) {
+        $pr = $script:W.Profiles[$i]
+        if (-not $pr) { return $false }
+        if (-not ($pr.NativeSaved -or ([uint32]$pr.TargetId -gt 0))) { return $false }
+    }
+    return $true
+}
+
+function Get-UnsavedActiveProfileNames {
+    $names = [System.Collections.Generic.List[string]]::new()
+    $max = [Math]::Min([int]$script:W.ProfileCount, [int]$script:W.Profiles.Count)
+    for ($i=0; $i -lt $max; $i++) {
+        $pr = $script:W.Profiles[$i]
+        if (-not $pr) {
+            $names.Add("Display$($i+1)")
+            continue
+        }
+        if (-not ($pr.NativeSaved -or ([uint32]$pr.TargetId -gt 0))) {
+            $name = if ($pr.Name) { [string]$pr.Name } else { "Display$($i+1)" }
+            $names.Add($name)
+        }
+    }
+    return @($names.ToArray())
 }
 
 # -- PAGE 3: Controllers -------------------------------------------------------
@@ -5792,6 +5878,19 @@ function Build-P5 {
     $saveBtn.Add_Click({
         Sync-ProfileData; Sync-ControllerData; Sync-SettingsData
         try {
+            $issues = @(Get-ConfigIssues)
+            if ($issues.Count -gt 0) {
+                $issueText = ($issues | ForEach-Object { "  - $_" }) -join "`n"
+                $result = [System.Windows.Forms.MessageBox]::Show(
+                    "SofaShift found $($issues.Count) configuration issue(s):`n`n$issueText`n`nSave anyway?",
+                    "Configuration issues", "YesNo", "Warning")
+                if ($result -eq "No") {
+                    $statusLbl.Text = "Save cancelled  -  fix the configuration issues above."
+                    $statusLbl.ForeColor = $cWarn
+                    return
+                }
+            }
+
             $appDir = if ($script:ScriptDir -and $script:ScriptDir.ToString().Trim()) { [string]$script:ScriptDir } else { Get-AppBaseDir }
             if (-not $appDir) { throw "Application directory could not be resolved." }
             $script:ScriptDir = $appDir
@@ -5899,17 +5998,33 @@ function Build-P5 {
                         $settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -StartWhenAvailable
                         # Match the stable V2 runtime: run the watcher elevated so FRL Toggle can
                         # apply driver settings. User-facing apps launch through explorer.exe.
-                        $principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Highest
-
                         $watchAction = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$watchLauncher`""
-                        Register-ScheduledTask -TaskName "SofaShift Monitor" `
-                            -Action $watchAction -Trigger $trigger -Settings $settings -Principal $principal `
-                            -Description "SofaShift controller watcher  -  auto-starts hidden on login" `
-                            -Force | Out-Null
-                        Write-DebugLog "Startup task: registered hidden watcher with wscript.exe '$watchLauncher'"
+                        $registeredElevated = $false
+                        try {
+                            $principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Highest
+                            Register-ScheduledTask -TaskName "SofaShift Monitor" `
+                                -Action $watchAction -Trigger $trigger -Settings $settings -Principal $principal `
+                                -Description "SofaShift controller watcher  -  auto-starts hidden on login" `
+                                -Force -ErrorAction Stop | Out-Null
+                            $registeredElevated = $true
+                            Write-DebugLog "Startup task: registered elevated hidden watcher with wscript.exe '$watchLauncher'"
+                        } catch {
+                            Write-DebugLog "Startup task: elevated registration failed: $($_.Exception.Message)"
+                            $principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive
+                            Register-ScheduledTask -TaskName "SofaShift Monitor" `
+                                -Action $watchAction -Trigger $trigger -Settings $settings -Principal $principal `
+                                -Description "SofaShift controller watcher  -  auto-starts hidden on login" `
+                                -Force -ErrorAction Stop | Out-Null
+                            Write-DebugLog "Startup task: registered non-elevated fallback hidden watcher with wscript.exe '$watchLauncher'"
+                        }
 
-                        $taskStatusLbl.Text      = "$([char]0x2713)  Startup registered  -  controller_watch.ps1 will launch hidden at login"
-                        $taskStatusLbl.ForeColor = $cOk
+                        if ($registeredElevated) {
+                            $taskStatusLbl.Text      = "$([char]0x2713)  Startup registered  -  controller_watch.ps1 will launch hidden at login"
+                            $taskStatusLbl.ForeColor = $cOk
+                        } else {
+                            $taskStatusLbl.Text      = "$([char]0x2713)  Startup registered without elevation  -  display switching works; FRL may need admin"
+                            $taskStatusLbl.ForeColor = $cWarn
+                        }
                     } catch {
                         $taskStatusLbl.Text      = "Task registration failed: $($_.Exception.Message)"
                         $taskStatusLbl.ForeColor = $cErr
@@ -6199,9 +6314,11 @@ $script:btnNext.Add_Click({
         2 {
             Sync-ProfileData
             if (-not (Test-ProfilesSaved)) {
+                $unsavedProfiles = @(Get-UnsavedActiveProfileNames)
+                $unsavedText = if ($unsavedProfiles.Count -gt 0) { "`n`nNeeds Save Profile:`n  - " + ($unsavedProfiles -join "`n  - ") } else { "" }
                 $result = [System.Windows.Forms.MessageBox]::Show(
-                    "No display profiles have been saved yet.`n`nYou should click 'Save Profile' for each display before continuing  -  otherwise controller_watch.ps1 won't know which resolution and settings to apply.`n`nContinue anyway?",
-                    "Profiles Not Saved", "YesNo", "Warning")
+                    "One or more display profiles have not been saved yet.$unsavedText`n`nClick 'Save Profile' for each active display before continuing. Otherwise controller_watch.ps1 may have TargetId=0 and will not switch displays for that profile.`n`nContinue anyway?",
+                    "Display Profiles Not Saved", "YesNo", "Warning")
                 if ($result -eq "No") { return }
             }
         }

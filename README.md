@@ -45,6 +45,7 @@ This repository includes the PowerShell source used to build the release install
 - `setup_wizard.ps1` - WinForms setup wizard and generated runtime file writer.
 - `controller_watch.ps1` - background controller monitor used after setup.
 - `build_wizard_exe.ps1` - build script that bundles the watcher into the wizard and compiles `SofaShift-Setup.exe` with ps2exe.
+- `SofaShift.ico` - application icon used by the compiled setup EXE.
 
 The release EXE is provided for convenience, but you can inspect the scripts directly before running it.
 

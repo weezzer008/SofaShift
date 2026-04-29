@@ -33,7 +33,7 @@ $watchPs1   = Join-Path $scriptDir "controller_watch.ps1"
 $iconFile   = Join-Path $scriptDir "SofaShift.ico"
 $jpegFile   = Join-Path $scriptDir "SofaShift.jpeg"
 $outputExe  = Join-Path $scriptDir "SofaShift-Setup.exe"
-$version    = "0.1.0.0"
+$version    = "1.0.0.0"
 
 # -- Convert JPEG to ICO if needed ---------------------------------------------
 if ((-not (Test-Path $iconFile)) -and (Test-Path $jpegFile)) {
