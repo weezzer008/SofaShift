@@ -1,7 +1,4 @@
-# Private build source and local build workspace files
-setup_wizard.ps1
-controller_watch.ps1
-build_wizard_exe.ps1
+# Local build workspace files
 PRE_RELEASE_TESTING.md
 GITHUB_RELEASE_NOTES_TEMPLATE.md
 SofaShift.ico
@@ -33,6 +30,11 @@ output/
 nircmd/
 FRLToggle/
 tools/
+
+# Local launch planning notes
+LAUNCH_KIT.md
+TRUST_RECOVERY_PLAN.md
+launch-tracking.csv
 
 # Local scratch
 *.tmp

@@ -10,9 +10,11 @@ Do not use GitHub's automatically generated `Source code (zip)` or `Source code 
 
 ## Runtime Model
 
-The setup wizard writes a data-only configuration file. The background watcher is registered as a per-user scheduled task without elevation. It watches local controller presence, switches displays/audio, and launches optional local applications selected by the user.
+The setup wizard writes a data-only configuration file. The background watcher is registered as a per-user scheduled task. It watches local controller presence, switches displays/audio, and launches optional local applications selected by the user.
 
-The setup EXE should not require administrator rights by default. FRL Toggle may require administrator rights on some machines because it can affect driver settings. SofaShift does not elevate the whole watcher for this; if FRL cannot apply, the watcher logs the failure and continues.
+The current setup EXE requests administrator rights so it can create the scheduled task with the run level needed for optional FRL Toggle behavior. SofaShift installs per-user files and an HKCU uninstall entry; it does not install a system service.
+
+FRL Toggle may require administrator rights on some machines because it can affect driver settings. If FRL cannot apply, the watcher logs the failure and continues.
 
 ## Third-Party Tools
 
