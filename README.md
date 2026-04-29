@@ -86,7 +86,7 @@ The current EXE requests administrator rights so it can create the scheduled tas
 
 - Windows SmartScreen may warn because this first release is unsigned. Use only the EXE attached to this repository's GitHub release.
 - Logs may include local paths, display identifiers, audio device names, and controller IDs. Redact logs before sharing them publicly.
-- SofaShift does not silently download, extract, or run third-party tools. It opens official pages and lets you select local executables.
+- When you click an install action for an optional tool, SofaShift may download, extract, or launch that selected tool's installer from its configured upstream project or publisher URL. Official-page links are also provided if you prefer to download and select local executables yourself.
 
 ## Uninstall
 

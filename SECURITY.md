@@ -18,9 +18,9 @@ FRL Toggle may require administrator rights on some machines because it can affe
 
 ## Third-Party Tools
 
-SofaShift supports optional user-supplied tools such as NirCmd, Playnite, Hue Sync, MonitorSwitcher, and FRL Toggle. The wizard opens official download pages but does not silently download, extract, or run third-party binaries.
+SofaShift supports optional tools such as NirCmd, Playnite, Hue Sync, MonitorSwitcher, and FRL Toggle. When you click an install action in the wizard, SofaShift may download, extract, or launch the selected tool's installer from the configured upstream project or publisher URL. The wizard also provides official-page links when you prefer to download and select a local executable yourself.
 
-Users should verify downloads from the original publisher before selecting them in SofaShift.
+Users should verify third-party downloads from the original publisher before installing or selecting them in SofaShift.
 
 ## Logs And Privacy
 
