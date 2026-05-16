@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  Controller-aware PC couch gaming setup for Windows.
+  Controller-triggered couch-mode automation for Windows gaming PCs.
 </p>
 
-SofaShift watches for mapped controller connections and helps your Windows gaming PC shift into couch mode: display profile, audio route, optional frame-rate cap, and couch-gaming apps.
+SofaShift watches for mapped controller connections and helps your Windows gaming PC shift from desk mode to couch mode: display profile, audio route, optional frame-rate cap, and couch-gaming apps.
 
 <p align="center">
   <img src="assets/sofashift-reddit-demo.gif" alt="SofaShift setup wizard animated walkthrough" width="100%">
@@ -26,7 +26,7 @@ If your desk setup and TV setup are never quite the same setup, SofaShift is for
 
 - Switch to a saved display profile for your TV or couch setup.
 - Route audio with NirCmd when configured.
-- Apply an optional frame-rate cap with FRL Toggle.
+- Apply an optional frame-rate cap with FRL Toggle when permitted by the system.
 - Launch Playnite, Hue Sync, and custom couch-gaming apps.
 - Restore your desktop profile when the mapped controller disconnects.
 
@@ -70,7 +70,7 @@ The build script creates `SofaShift-Setup.exe` in the repository folder. It embe
 
 - Windows 10 or Windows 11.
 - PowerShell for the background monitor. Windows PowerShell 5.1 is normally built into Windows 10/11, and PowerShell 7 is also supported.
-- Optional tools: NirCmd for audio switching, Playnite, Hue Sync, MonitorSwitcher, and FRL Toggle.
+- Optional tools: NirCmd for audio switching, Playnite, Hue Sync, and FRL Toggle.
 
 ## Install
 
@@ -80,13 +80,13 @@ The build script creates `SofaShift-Setup.exe` in the repository folder. It embe
 
 The setup EXE writes the monitor script, config, launcher, logs, and uninstall helper beside itself. Keep those generated files together with the EXE.
 
-The current EXE requests administrator rights so it can create the scheduled task with the run level needed for optional FRL Toggle behavior. SofaShift installs per-user files and an HKCU uninstall entry; it does not install a system service.
+The setup EXE runs without administrator rights by default. SofaShift installs per-user files, a per-user startup task, and an HKCU uninstall entry; it does not install a system service. FRL Toggle may still require administrator rights on some PCs, and SofaShift logs that failure without elevating its background watcher.
 
 ## Notes
 
 - Windows SmartScreen may warn because this first release is unsigned. Use only the EXE attached to this repository's GitHub release.
 - Logs may include local paths, display identifiers, audio device names, and controller IDs. Redact logs before sharing them publicly.
-- When you click an install action for an optional tool, SofaShift may download, extract, or launch that selected tool's installer from its configured upstream project or publisher URL. Official-page links are also provided if you prefer to download and select local executables yourself.
+- When you click an install action for an optional tool, SofaShift resolves the upstream download, stages it locally, shows SHA256/signature information, and asks for confirmation before launching or placing the tool. Official-page links are also provided if you prefer to download and select local executables yourself.
 
 ## Uninstall
 

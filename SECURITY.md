@@ -12,13 +12,13 @@ Do not use GitHub's automatically generated `Source code (zip)` or `Source code 
 
 The setup wizard writes a data-only configuration file. The background watcher is registered as a per-user scheduled task. It watches local controller presence, switches displays/audio, and launches optional local applications selected by the user.
 
-The current setup EXE requests administrator rights so it can create the scheduled task with the run level needed for optional FRL Toggle behavior. SofaShift installs per-user files and an HKCU uninstall entry; it does not install a system service.
+The setup EXE runs without administrator rights by default. SofaShift installs per-user files, a per-user startup task, and an HKCU uninstall entry; it does not install a system service.
 
 FRL Toggle may require administrator rights on some machines because it can affect driver settings. If FRL cannot apply, the watcher logs the failure and continues.
 
 ## Third-Party Tools
 
-SofaShift supports optional tools such as NirCmd, Playnite, Hue Sync, MonitorSwitcher, and FRL Toggle. When you click an install action in the wizard, SofaShift may download, extract, or launch the selected tool's installer from the configured upstream project or publisher URL. The wizard also provides official-page links when you prefer to download and select a local executable yourself.
+SofaShift supports optional tools such as NirCmd, Playnite, Hue Sync, and FRL Toggle. When you click an install action in the wizard, SofaShift resolves the upstream download, stages it locally, shows SHA256/signature information, and asks for confirmation before launching or placing the tool. The wizard also provides official-page links when you prefer to download and select a local executable yourself.
 
 Users should verify third-party downloads from the original publisher before installing or selecting them in SofaShift.
 

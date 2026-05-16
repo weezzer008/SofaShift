@@ -33,7 +33,7 @@ $watchPs1   = Join-Path $scriptDir "controller_watch.ps1"
 $iconFile   = Join-Path $scriptDir "SofaShift.ico"
 $jpegFile   = Join-Path $scriptDir "SofaShift.jpeg"
 $outputExe  = Join-Path $scriptDir "SofaShift-Setup.exe"
-$version    = "1.0.0.0"
+$version    = "1.0.1.0"
 
 # -- Convert JPEG to ICO if needed ---------------------------------------------
 if ((-not (Test-Path $iconFile)) -and (Test-Path $jpegFile)) {
@@ -213,9 +213,8 @@ $compileParams = @{
     # GUI flags
     noConsole   = $true      # no black console window behind the WinForms UI
     STA         = $true      # Single-Threaded Apartment  -  REQUIRED for WinForms/WPF
-    # Match the stable V2 installer/runtime behavior: elevate the wizard so it can
-    # register the startup task at the same privilege level as the watcher expects.
-    requireAdmin = $true
+    # Keep the setup wizard unelevated by default. The background watcher also runs
+    # unelevated so user-writable scripts/configs are not launched at high integrity.
     # Suppress ps2exe's own output/error streams so our messages stay clean
     noOutput    = $true
     noError     = $true
@@ -268,7 +267,7 @@ if (Test-Path $outputExe) {
     Write-Host "  -----------------------------------------" -ForegroundColor DarkGray
     Write-Host "  Distribution:" -ForegroundColor Cyan
     Write-Host "    Share SofaShift-Setup.exe with any Windows 10/11 user." -ForegroundColor Gray
-    Write-Host "    They right-click and 'Run as administrator' (or it auto-elevates)." -ForegroundColor Gray
+    Write-Host "    They run the setup wizard normally; it does not require admin by default." -ForegroundColor Gray
     Write-Host "    The setup EXE is self-contained; the background monitor uses PowerShell." -ForegroundColor Gray
     Write-Host "    If PowerShell is missing, SofaShift prompts the user to install it." -ForegroundColor Gray
     Write-Host ""

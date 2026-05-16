@@ -342,6 +342,7 @@ Write-Log "Watching $($global:WatchedControllerIds.Count) mapped controller ID(s
 # ============================================================
 Add-Type -TypeDefinition @"
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
 public class SofaCcd
@@ -361,6 +362,7 @@ public class SofaCcd
     public const uint DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE = 1;
     public const uint DISPLAYCONFIG_PIXELFORMAT_32BPP = 4;
     public const uint DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
+    public const uint DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME = 2;
 
     // ChangeDisplaySettingsEx constants
     public const int ENUM_CURRENT_SETTINGS = -1;
@@ -389,6 +391,23 @@ public class SofaCcd
         public string viewGdiDeviceName;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DISPLAYCONFIG_TARGET_DEVICE_NAME_FLAGS { public uint value; }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DISPLAYCONFIG_TARGET_DEVICE_NAME {
+        public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+        public DISPLAYCONFIG_TARGET_DEVICE_NAME_FLAGS flags;
+        public uint outputTechnology;
+        public ushort edidManufactureId;
+        public ushort edidProductCodeId;
+        public uint connectorInstance;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string monitorFriendlyDeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string monitorDevicePath;
+    }
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
     public struct DEVMODE {
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
@@ -406,6 +425,8 @@ public class SofaCcd
     [DllImport("user32.dll")] public static extern int SetDisplayConfig(uint numPathArrayElements, [In] DISPLAYCONFIG_PATH_INFO[] pathArray, uint numModeInfoArrayElements, [In] DISPLAYCONFIG_MODE_INFO[] modeInfoArray, uint flags);
     [DllImport("user32.dll", EntryPoint = "DisplayConfigGetDeviceInfo")]
     public static extern int DisplayConfigGetDeviceInfoSource(ref DISPLAYCONFIG_SOURCE_DEVICE_NAME requestPacket);
+    [DllImport("user32.dll", EntryPoint = "DisplayConfigGetDeviceInfo")]
+    public static extern int DisplayConfigGetDeviceInfoTarget(ref DISPLAYCONFIG_TARGET_DEVICE_NAME requestPacket);
     [DllImport("user32.dll", CharSet = CharSet.Ansi)]
     public static extern bool EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);
     [DllImport("user32.dll", CharSet = CharSet.Ansi)]
@@ -427,6 +448,124 @@ public class SofaCcd
             if (modeCount != modes.Length) Array.Resize(ref modes, (int)modeCount);
             break;
         } while (true);
+    }
+
+    public class TargetRecord {
+        public uint AdapterLow { get; set; }
+        public int AdapterHigh { get; set; }
+        public uint SourceId { get; set; }
+        public uint TargetId { get; set; }
+        public string DevicePath { get; set; }
+        public string Friendly { get; set; }
+        public bool IsActive { get; set; }
+        public bool TargetAvailable { get; set; }
+    }
+
+    static string TargetName(LUID adapterId, uint targetId, out string devicePath)
+    {
+        devicePath = "";
+        var target = new DISPLAYCONFIG_TARGET_DEVICE_NAME();
+        target.header.size = (uint)Marshal.SizeOf(typeof(DISPLAYCONFIG_TARGET_DEVICE_NAME));
+        target.header.adapterId = adapterId;
+        target.header.id = targetId;
+        target.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        int rc = DisplayConfigGetDeviceInfoTarget(ref target);
+        if (rc != 0) return "";
+        devicePath = target.monitorDevicePath ?? "";
+        return string.IsNullOrWhiteSpace(target.monitorFriendlyDeviceName) ? "" : target.monitorFriendlyDeviceName.Trim();
+    }
+
+    static bool SameText(string left, string right)
+    {
+        return !string.IsNullOrWhiteSpace(left) &&
+               !string.IsNullOrWhiteSpace(right) &&
+               string.Equals(left.Trim(), right.Trim(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    static TargetRecord ToTargetRecord(DISPLAYCONFIG_PATH_INFO path, string devicePath, string friendly)
+    {
+        return new TargetRecord {
+            AdapterLow = path.targetInfo.adapterId.LowPart,
+            AdapterHigh = path.targetInfo.adapterId.HighPart,
+            SourceId = path.sourceInfo.id,
+            TargetId = path.targetInfo.id,
+            DevicePath = devicePath ?? "",
+            Friendly = friendly ?? "",
+            IsActive = (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0,
+            TargetAvailable = path.targetInfo.targetAvailable
+        };
+    }
+
+    public static TargetRecord ResolveTarget(uint adapterLow, int adapterHigh, uint sourceId, uint targetId, string savedDevicePath, string savedFriendly)
+    {
+        DISPLAYCONFIG_PATH_INFO[] paths;
+        DISPLAYCONFIG_MODE_INFO[] modes;
+        Query(out paths, out modes);
+
+        bool hasSavedDevicePath = !string.IsNullOrWhiteSpace(savedDevicePath);
+        TargetRecord bestStable = null;
+        int bestStableScore = Int32.MinValue;
+        var friendlyMatches = new List<TargetRecord>();
+
+        foreach (var p in paths) {
+            string devicePath;
+            string friendly = TargetName(p.targetInfo.adapterId, p.targetInfo.id, out devicePath);
+            bool exactTarget = (p.targetInfo.adapterId.LowPart == adapterLow &&
+                                p.targetInfo.adapterId.HighPart == adapterHigh &&
+                                p.targetInfo.id == targetId);
+            bool pathMatch = SameText(savedDevicePath, devicePath);
+            bool friendlyMatch = SameText(savedFriendly, friendly);
+
+            if (hasSavedDevicePath) {
+                if (!pathMatch) continue;
+            } else if (!exactTarget && !friendlyMatch) {
+                continue;
+            }
+
+            var record = ToTargetRecord(p, devicePath, friendly);
+            if (pathMatch || (!hasSavedDevicePath && exactTarget)) {
+                int score = 0;
+                if (pathMatch) score += 10000;
+                if (exactTarget) score += 1000;
+                if (record.TargetAvailable) score += 500;
+                if (record.IsActive) score += 250;
+                if (p.sourceInfo.id == sourceId) score += 25;
+                if (score > bestStableScore) {
+                    bestStableScore = score;
+                    bestStable = record;
+                }
+            } else if (!hasSavedDevicePath && friendlyMatch) {
+                friendlyMatches.Add(record);
+            }
+        }
+
+        if (hasSavedDevicePath) return bestStable;
+
+        TargetRecord friendlyFallback = null;
+        if (friendlyMatches.Count == 1) friendlyFallback = friendlyMatches[0];
+
+        TargetRecord onlyAvailableFriendly = null;
+        bool ambiguousAvailableFriendly = false;
+        foreach (var record in friendlyMatches) {
+            if (!record.TargetAvailable && !record.IsActive) continue;
+            if (onlyAvailableFriendly != null) {
+                ambiguousAvailableFriendly = true;
+                onlyAvailableFriendly = null;
+                break;
+            }
+            onlyAvailableFriendly = record;
+        }
+        if (!ambiguousAvailableFriendly && onlyAvailableFriendly != null) friendlyFallback = onlyAvailableFriendly;
+
+        if (bestStable != null) {
+            if (bestStable.TargetAvailable || bestStable.IsActive || friendlyFallback == null)
+                return bestStable;
+            if (friendlyFallback.TargetAvailable || friendlyFallback.IsActive)
+                return friendlyFallback;
+            return bestStable;
+        }
+
+        return friendlyFallback;
     }
 
     public static bool GetTargetAvailable(uint adapterLow, int adapterHigh, uint targetId)
@@ -665,12 +804,92 @@ try {
     Write-Log "Initial present scan failed: $($_.Exception.Message)"
 }
 
+function Get-ProfileValue {
+    param(
+        [Parameter(Mandatory=$true)]$Profile,
+        [Parameter(Mandatory=$true)][string]$Name,
+        $Default = $null
+    )
+
+    if ($Profile -is [hashtable]) {
+        if ($Profile.ContainsKey($Name)) { return $Profile[$Name] }
+        return $Default
+    }
+    if ($Profile.PSObject.Properties[$Name]) { return $Profile.$Name }
+    return $Default
+}
+
+function Resolve-CcdProfileTarget {
+    param(
+        [Parameter(Mandatory=$true)]$Profile,
+        [string]$ProfileName = ""
+    )
+
+    $saved = [pscustomobject]@{
+        AdapterLow      = [uint32](Get-ProfileValue $Profile 'AdapterLow' 0)
+        AdapterHigh     = [int](Get-ProfileValue $Profile 'AdapterHigh' 0)
+        SourceId        = [uint32](Get-ProfileValue $Profile 'SourceId' 0)
+        TargetId        = [uint32](Get-ProfileValue $Profile 'TargetId' 0)
+        DevicePath      = [string](Get-ProfileValue $Profile 'DevicePath' '')
+        Friendly        = [string](Get-ProfileValue $Profile 'Friendly' '')
+        IsResolved      = $false
+        IsRemapped      = $false
+        TargetAvailable = $false
+        IsActive        = $false
+        BlockReason     = ''
+    }
+
+    try {
+        $resolved = [SofaCcd]::ResolveTarget(
+            [uint32]$saved.AdapterLow,
+            [int]$saved.AdapterHigh,
+            [uint32]$saved.SourceId,
+            [uint32]$saved.TargetId,
+            [string]$saved.DevicePath,
+            [string]$saved.Friendly
+        )
+        if ($resolved) {
+            $isRemapped = (
+                [uint32]$resolved.AdapterLow -ne [uint32]$saved.AdapterLow -or
+                [int]$resolved.AdapterHigh -ne [int]$saved.AdapterHigh -or
+                [uint32]$resolved.SourceId -ne [uint32]$saved.SourceId -or
+                [uint32]$resolved.TargetId -ne [uint32]$saved.TargetId
+            )
+            return [pscustomobject]@{
+                AdapterLow      = [uint32]$resolved.AdapterLow
+                AdapterHigh     = [int]$resolved.AdapterHigh
+                SourceId        = [uint32]$resolved.SourceId
+                TargetId        = [uint32]$resolved.TargetId
+                DevicePath      = [string]$resolved.DevicePath
+                Friendly        = [string]$resolved.Friendly
+                IsResolved      = $true
+                IsRemapped      = $isRemapped
+                TargetAvailable = [bool]$resolved.TargetAvailable
+                IsActive        = [bool]$resolved.IsActive
+                BlockReason     = ''
+            }
+        }
+    } catch {
+        Write-Log "WARNING: Could not re-resolve CCD target for '$ProfileName': $($_.Exception.Message)"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$saved.DevicePath)) {
+        $saved.BlockReason = "Saved display '$($saved.Friendly)' is not currently present; refusing to apply this profile to a different HDMI target."
+    }
+    return $saved
+}
+
 function Invoke-DisplayProfile {
     param([string]$ProfileName)
     $p = $cfg_Profiles[$ProfileName]
     if (-not $p) { Write-Log "Unknown profile: $ProfileName"; return }
 
-    if (-not ($p.TargetId -and [uint32]$p.TargetId -gt 0)) {
+    $target = Resolve-CcdProfileTarget -Profile $p -ProfileName $ProfileName
+    if ($target.PSObject.Properties['BlockReason'] -and $target.BlockReason) {
+        Write-Log "WARNING: Profile '$ProfileName' skipped - $($target.BlockReason)"
+        return
+    }
+    if (-not ($target.TargetId -and [uint32]$target.TargetId -gt 0)) {
         Write-Log "ERROR: Profile '$ProfileName' has TargetId=0 - re-run the setup wizard and click Save Profile on Step 3"
         return
     }
@@ -685,18 +904,27 @@ function Invoke-DisplayProfile {
     # causing SetDisplayConfig to return ERROR_INVALID_PARAMETER (87). A short wait
     # is usually enough for targetAvailable to flip true.
     $rc = -1
+    $lastTargetKey = ""
     for ($attempt = 1; $attempt -le 4; $attempt++) {
+        $target = Resolve-CcdProfileTarget -Profile $p -ProfileName $ProfileName
+        $targetKey = "$($target.AdapterHigh):$($target.AdapterLow):$($target.SourceId):$($target.TargetId)"
+        if ($targetKey -ne $lastTargetKey) {
+            if ($target.IsRemapped) {
+                Write-Log "  Re-resolved CCD target for '$ProfileName' to targetId=$($target.TargetId) via saved display identity"
+            }
+            $lastTargetKey = $targetKey
+        }
         if ($attempt -gt 1) {
-            $avail = [SofaCcd]::GetTargetAvailable([uint32]$p.AdapterLow, [int]$p.AdapterHigh, [uint32]$p.TargetId)
+            $avail = [SofaCcd]::GetTargetAvailable([uint32]$target.AdapterLow, [int]$target.AdapterHigh, [uint32]$target.TargetId)
             Write-Log "  CCD code $rc on attempt $($attempt-1) (targetAvailable=$avail) - waiting 2 s..."
             Start-Sleep -Seconds 2
         }
-        $rc = [SofaCcd]::ApplyDisplay([uint32]$p.AdapterLow, [int]$p.AdapterHigh, [uint32]$p.SourceId, [uint32]$p.TargetId, $w, $h)
+        $rc = [SofaCcd]::ApplyDisplay([uint32]$target.AdapterLow, [int]$target.AdapterHigh, [uint32]$target.SourceId, [uint32]$target.TargetId, $w, $h)
         if ($rc -eq 0) { break }
     }
 
     if ($rc -eq 0) {
-        Write-Log "CCD apply succeeded for targetId=$($p.TargetId)"
+        Write-Log "CCD apply succeeded for targetId=$($target.TargetId)"
 
         # Apply the configured refresh rate via ChangeDisplaySettingsEx.
         # CCD activates the display but lets Windows pick any Hz; this call enforces
@@ -706,23 +934,23 @@ function Invoke-DisplayProfile {
         if ($rhz -match '^\d+$') { $hz = [uint32]$rhz }
         if ($hz -gt 0) {
             Start-Sleep -Milliseconds 800   # let display link stabilise after topology switch
-            $devName = [SofaCcd]::GetActiveSourceName([uint32]$p.AdapterLow, [int]$p.AdapterHigh, [uint32]$p.TargetId)
+            $devName = [SofaCcd]::GetActiveSourceName([uint32]$target.AdapterLow, [int]$target.AdapterHigh, [uint32]$target.TargetId)
             if ($devName) {
                 $rrc = [SofaCcd]::SetRefreshRate($devName, $w, $h, $hz)
                 if ($rrc -eq 0) { Write-Log "Refresh rate set to $hz Hz on $devName" }
                 else { Write-Log "WARNING: SetRefreshRate returned $rrc for $devName @ $hz Hz (display may not support this mode)" }
             } else {
-                Write-Log "WARNING: Could not find active GDI source for targetId=$($p.TargetId) - refresh rate not applied"
+                Write-Log "WARNING: Could not find active GDI source for targetId=$($target.TargetId) - refresh rate not applied"
             }
         }
     } else {
-        $avail = [SofaCcd]::GetTargetAvailable([uint32]$p.AdapterLow, [int]$p.AdapterHigh, [uint32]$p.TargetId)
+        $avail = [SofaCcd]::GetTargetAvailable([uint32]$target.AdapterLow, [int]$target.AdapterHigh, [uint32]$target.TargetId)
         Write-Log "ERROR: CCD apply failed with code $rc for profile '$ProfileName' (targetAvailable=$avail)"
     }
 
     # 2. Set frame rate limit (skip cleanly if disabled, or if cap is 0/Unlimited).
-    # frltoggle.exe writes to the NVIDIA driver registry and needs admin; the scheduled task
-    # MUST run with RunLevel Highest (set by setup_wizard.ps1) for this to take effect.
+    # FRL Toggle may require elevation on some machines. SofaShift runs the watcher
+    # unelevated by default; failures are logged without elevating user-writable scripts.
     $frlCap = 0
     $frlRaw = [string]$p.FRL
     Write-Log "FRL: profile FRL='$frlRaw' (raw value from config)"
@@ -735,7 +963,7 @@ function Invoke-DisplayProfile {
                               -Wait -WindowStyle Hidden -PassThru -ErrorAction Stop
                 Write-Log "FRL: frltoggle exit code = $($proc.ExitCode) (0 = success)"
                 if ($proc.ExitCode -ne 0) {
-                    Write-Log "FRL: NOTE - frltoggle returned non-zero. The most common cause is that the watcher is not running elevated. Re-run the setup wizard so it can recreate the scheduled task with RunLevel Highest."
+                    Write-Log "FRL: NOTE - frltoggle returned non-zero. It may require administrator rights on this PC; display/audio/app switching will continue."
                 }
             } catch {
                 Write-Log "FRL ERROR: $($_.Exception.Message)"
@@ -769,21 +997,62 @@ function Start-HueSync {
         return
     }
     Write-Log "Starting Hue Sync"
+    Register-LaunchedProcess -Label "Hue Sync" -Path $cfg_HueSync -ProcessNames @("HueSync","handler")
     Start-Process -FilePath $cfg_HueSync -WindowStyle Minimized
 }
 
 function Stop-HueSync {
-    if (-not $cfg_HueSync) { return }
-    $procs = Get-Process -Name "HueSync","handler" -ErrorAction SilentlyContinue
-    if (-not $procs) { return }
-    foreach ($proc in $procs) {
-        Write-Log "Stopping $($proc.Name) PID $($proc.Id)"
-        $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-LaunchedProcesses -Label "Hue Sync"
+}
+
+function Register-LaunchedProcess {
+    param(
+        [Parameter(Mandatory=$true)][string]$Label,
+        [string]$Path = "",
+        [string[]]$ProcessNames = @()
+    )
+
+    if (-not $global:LaunchedProcesses) { $global:LaunchedProcesses = @{} }
+    $names = @($ProcessNames | Where-Object { $_ })
+    if ($names.Count -eq 0 -and $Path) { $names = @([System.IO.Path]::GetFileNameWithoutExtension($Path)) }
+    $global:LaunchedProcesses[$Label] = [pscustomobject]@{
+        Path = [string]$Path
+        ProcessNames = $names
+        LaunchedAt = Get-Date
     }
-    # Brief grace period then force-kill anything still hanging
-    Start-Sleep -Milliseconds 800
-    Get-Process -Name "HueSync","handler" -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
+    Write-Log "Tracking launched $Label from $Path"
+}
+
+function Stop-LaunchedProcesses {
+    param([Parameter(Mandatory=$true)][string]$Label)
+
+    if (-not $global:LaunchedProcesses -or -not $global:LaunchedProcesses.ContainsKey($Label)) { return }
+    $entry = $global:LaunchedProcesses[$Label]
+    $names = @($entry.ProcessNames | Where-Object { $_ })
+    foreach ($name in $names) {
+        $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
+        foreach ($proc in @($procs)) {
+            try {
+                if ($proc.StartTime -lt $entry.LaunchedAt.AddSeconds(-2)) {
+                    Write-Log "Skipping $Label PID $($proc.Id); it was already running before SofaShift launched it"
+                    continue
+                }
+                if ($entry.Path -and $proc.Path -and ([string]$proc.Path -ne [string]$entry.Path) -and $name -ne "handler") {
+                    Write-Log "Skipping $Label PID $($proc.Id); executable path does not match configured target"
+                    continue
+                }
+                if ($entry.Path -and -not $proc.Path -and $name -ne "handler") {
+                    Write-Log "Skipping $Label PID $($proc.Id); executable path could not be verified"
+                    continue
+                }
+                Write-Log "Stopping launched $Label PID $($proc.Id)"
+                $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-Log "Could not inspect or stop $Label PID $($proc.Id): $($_.Exception.Message)"
+            }
+        }
+    }
+    $global:LaunchedProcesses.Remove($Label)
 }
 
 function Start-CustomApp {
@@ -821,40 +1090,17 @@ function Start-CustomApp {
             continue
         }
         Write-Log "Starting custom app '$($app.Label)': $($app.Path)"
-        Start-Process "explorer.exe" -ArgumentList "`"$($app.Path)`""
+        Register-LaunchedProcess -Label "Custom app" -Path $app.Path
+        Start-Process -FilePath $app.Path
     }
 }
 
 function Stop-CustomApp {
-    $paths = @()
-    if (Get-Variable 'cfg_CustomApps' -Scope Global -ErrorAction SilentlyContinue) {
-        foreach ($app in @($cfg_CustomApps)) {
-            if (-not $app) { continue }
-            if ($app -is [hashtable] -and $app.ContainsKey('Path') -and $app.Path) { $paths += [string]$app.Path }
-            elseif ($app.PSObject.Properties['Path'] -and $app.Path) { $paths += [string]$app.Path }
-        }
-    }
-    if ($paths.Count -eq 0 -and (Get-Variable 'cfg_CustomApp' -Scope Global -ErrorAction SilentlyContinue) -and $cfg_CustomApp) { $paths += [string]$cfg_CustomApp }
-    foreach ($path in $paths) {
-        $procName = [System.IO.Path]::GetFileNameWithoutExtension($path)
-        $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
-        if (-not $procs) { continue }
-        foreach ($proc in $procs) {
-            Write-Log "Stopping custom app '$($proc.Name)' PID $($proc.Id)"
-            $proc | Stop-Process -Force -ErrorAction SilentlyContinue
-        }
-    }
+    Stop-LaunchedProcesses -Label "Custom app"
 }
 
 function Stop-Playnite {
-    # Target Playnite directly by process name - avoids enumerating every process on the
-    # system and swallowing access-denied errors on elevated processes.
-    $procs = Get-Process -Name 'Playnite.FullscreenApp','Playnite.DesktopApp' -ErrorAction SilentlyContinue
-    if (-not $procs) { return }
-    foreach ($proc in $procs) {
-        Write-Log "Stopping $($proc.Name) PID $($proc.Id)"
-        $proc | Stop-Process -Force -ErrorAction SilentlyContinue
-    }
+    Stop-LaunchedProcesses -Label "Playnite"
 }
 
 function Invoke-MinimizeAll {
@@ -915,6 +1161,7 @@ $global:LastPresentIds   = @()
 $global:LastAnyPresent   = $false
 $global:ActiveProfile    = $null       # currently loaded profile name
 $global:OfflineStartTime = $null       # when all controllers went offline
+$global:LaunchedProcesses = @{}
 
 # ============================================================
 # Connect / Disconnect handlers
@@ -964,8 +1211,8 @@ function Handle-Connect {
     if ($usePlaynite) {
         if ($cfg_Playnite -and (Test-Path $cfg_Playnite)) {
             Write-Log "Launching Playnite"
-            # Launch via explorer so it inherits the non-elevated user token instead of this task's admin token
-            Start-Process "explorer.exe" -ArgumentList "`"$cfg_Playnite`""
+            Register-LaunchedProcess -Label "Playnite" -Path $cfg_Playnite -ProcessNames @("Playnite.FullscreenApp","Playnite.DesktopApp")
+            Start-Process -FilePath $cfg_Playnite
         } elseif ($cfg_Playnite) {
             Write-Log "WARNING: Playnite not found: $cfg_Playnite"
         }
@@ -1057,6 +1304,9 @@ while ($true) {
 
     Start-Sleep -Milliseconds $script:PollMs
 }
+
+
+
 
 
 
@@ -1286,6 +1536,7 @@ public class SofaCcd
         public string DevicePath { get; set; }
         public bool IsActive { get; set; }
         public bool IsPrimary { get; set; }
+        public bool TargetAvailable { get; set; }
         public int Width { get; set; }
         public int Height { get; set; }
         public int RefreshHz { get; set; }
@@ -1368,6 +1619,7 @@ public class SofaCcd
             string gdi = SourceName(path.sourceInfo.adapterId, path.sourceInfo.id);
             bool isActive = (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0;
             bool isPrimary = PathLooksPrimary(path, modes);
+            bool targetAvailable = path.targetInfo.targetAvailable;
             int width = 0, height = 0, hz = 0;
             if (path.sourceInfo.modeInfoIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID && path.sourceInfo.modeInfoIdx < modes.Length)
             {
@@ -1391,7 +1643,9 @@ public class SofaCcd
                 }
             }
             string label = string.IsNullOrWhiteSpace(friendly) ? (string.IsNullOrWhiteSpace(gdi) ? ("Display " + path.targetInfo.id) : gdi) : friendly;
-            label += isActive ? " - Active" : " - Connected, inactive";
+            if (isActive) label += " - Active";
+            else if (targetAvailable) label += " - Connected, inactive";
+            else label += " - Remembered, unavailable";
             if (width > 0 && height > 0)
             {
                 label += " - " + width + "x" + height;
@@ -1405,6 +1659,7 @@ public class SofaCcd
                 DevicePath = devicePath ?? "",
                 IsActive = isActive,
                 IsPrimary = isPrimary,
+                TargetAvailable = targetAvailable,
                 Width = width,
                 Height = height,
                 RefreshHz = hz,
@@ -1678,6 +1933,120 @@ function Test-ProfileHasNativeTarget {
     return ($hasAdapter -and $hasTarget)
 }
 
+function Get-ProfileValue {
+    param(
+        [Parameter(Mandatory=$true)]$Profile,
+        [Parameter(Mandatory=$true)][string]$Name,
+        $Default = $null
+    )
+
+    if ($Profile -is [hashtable]) {
+        if ($Profile.ContainsKey($Name)) { return $Profile[$Name] }
+        return $Default
+    }
+    if ($Profile.PSObject.Properties.Match($Name).Count -gt 0) { return $Profile.$Name }
+    return $Default
+}
+
+function Get-DisplayBaseName {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+    $s = $Text.Trim()
+    $s = $s -replace '\s+-\s+(Active|Connected, inactive|Remembered, unavailable).*$',''
+    $s = $s -replace '^\s*Saved target unavailable:\s*',''
+    return $s.Trim()
+}
+
+function Select-BestDisplayRecord {
+    param($Records)
+    @($Records |
+        Sort-Object @{Expression='IsPrimary';Descending=$true},
+                    @{Expression='IsActive';Descending=$true},
+                    @{Expression='TargetAvailable';Descending=$true},
+                    @{Expression='Width';Descending=$true},
+                    @{Expression='Height';Descending=$true} |
+        Select-Object -First 1)
+}
+
+function Get-MatchingDisplayForProfile {
+    param(
+        [Parameter(Mandatory=$true)]$Profile,
+        [Parameter(Mandatory=$true)]$DisplayItems
+    )
+
+    $items = @($DisplayItems | Where-Object { $_ })
+    if ($items.Count -eq 0) { return $null }
+
+    $devicePath = [string](Get-ProfileValue $Profile 'DevicePath' '')
+    if (-not [string]::IsNullOrWhiteSpace($devicePath)) {
+        $matches = @($items | Where-Object { $_.DeviceId -and ([string]$_.DeviceId).Trim() -ieq $devicePath.Trim() })
+        if ($matches.Count -gt 0) { return @(Select-BestDisplayRecord $matches)[0] }
+        return $null
+    }
+
+    $targetId = [uint32](Get-ProfileValue $Profile 'TargetId' 0)
+    $adapterLow = [uint32](Get-ProfileValue $Profile 'AdapterLow' 0)
+    $adapterHigh = [int](Get-ProfileValue $Profile 'AdapterHigh' 0)
+    if ($targetId -gt 0) {
+        $matches = @($items | Where-Object {
+            [uint32]$_.TargetId -eq $targetId -and
+            [uint32]$_.AdapterLow -eq $adapterLow -and
+            [int]$_.AdapterHigh -eq $adapterHigh
+        })
+        if ($matches.Count -gt 0) { return @(Select-BestDisplayRecord $matches)[0] }
+    }
+
+    $targetDisplay = [string](Get-ProfileValue $Profile 'TargetDisplay' '')
+    if (-not [string]::IsNullOrWhiteSpace($targetDisplay)) {
+        $matches = @($items | Where-Object { $_.Label -and ([string]$_.Label).Trim() -ieq $targetDisplay.Trim() })
+        if ($matches.Count -gt 0) { return @(Select-BestDisplayRecord $matches)[0] }
+    }
+
+    $friendly = [string](Get-ProfileValue $Profile 'Friendly' '')
+    foreach ($name in @($friendly, (Get-DisplayBaseName $targetDisplay))) {
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        $matches = @($items | Where-Object {
+            ($_.Friendly -and ([string]$_.Friendly).Trim() -ieq $name.Trim()) -or
+            ((Get-DisplayBaseName ([string]$_.Label)) -ieq $name.Trim())
+        })
+        if ($matches.Count -eq 1) { return $matches[0] }
+        $availableMatches = @($matches | Where-Object { $_.IsActive -or $_.TargetAvailable })
+        if ($availableMatches.Count -eq 1) { return $availableMatches[0] }
+    }
+
+    return $null
+}
+
+function Update-NativeProfileFromDisplay {
+    param(
+        [Parameter(Mandatory=$true)]$Profile,
+        [Parameter(Mandatory=$true)]$Display
+    )
+
+    if (-not (Test-ProfileHasNativeTarget $Profile)) { return $false }
+    if (-not $Display -or [uint32]$Display.TargetId -eq 0) { return $false }
+
+    $changed = $false
+    foreach ($field in @('AdapterLow','AdapterHigh','SourceId','TargetId','DevicePath','Friendly','TargetDisplay')) {
+        $newValue = switch ($field) {
+            'AdapterLow'     { [uint32]$Display.AdapterLow; break }
+            'AdapterHigh'    { [int]$Display.AdapterHigh; break }
+            'SourceId'       { [uint32]$Display.SourceId; break }
+            'TargetId'       { [uint32]$Display.TargetId; break }
+            'DevicePath'     { [string]$Display.DeviceId; break }
+            'Friendly'       { [string]$Display.Friendly; break }
+            'TargetDisplay'  { [string]$Display.Label; break }
+        }
+        $oldValue = Get-ProfileValue $Profile $field $null
+        if ([string]$oldValue -ne [string]$newValue) {
+            try { $Profile.$field = $newValue }
+            catch { $Profile | Add-Member -NotePropertyName $field -NotePropertyValue $newValue -Force }
+            $changed = $true
+        }
+    }
+    return $changed
+}
+
 
 function Get-LegacyDisplays {
     $items = [System.Collections.Generic.List[object]]::new()
@@ -1736,6 +2105,7 @@ function Get-LegacyDisplays {
             Friendly    = $friendly
             IsPrimary   = $isPrimary
             IsActive    = $isActive
+            TargetAvailable = $isActive
             AdapterLow  = [uint32]0
             AdapterHigh = [int]0
             SourceId    = [uint32]0
@@ -1779,6 +2149,7 @@ function Get-ActiveDisplays {
                 Friendly    = $cleanFriendly
                 IsPrimary   = [bool]$d.IsPrimary
                 IsActive    = [bool]$d.IsActive
+                TargetAvailable = [bool]$d.TargetAvailable
                 AdapterLow  = [uint32]$d.AdapterLow
                 AdapterHigh = [int]$d.AdapterHigh
                 SourceId    = [uint32]$d.SourceId
@@ -1789,12 +2160,28 @@ function Get-ActiveDisplays {
             }) | Out-Null
         }
         $usableItems = @($items | Where-Object { Test-FriendlyDisplayRecord $_ })
+        $availableItems = @($usableItems | Where-Object {
+            $baseName = Get-DisplayBaseName ([string]$_.Friendly)
+            $isGenericInactiveName = ($baseName -match '^Display \d+$')
+            $_.IsActive -or ($_.TargetAvailable -and -not $isGenericInactiveName)
+        })
+        if ($availableItems.Count -gt 0) { $usableItems = $availableItems }
         $items = [System.Collections.Generic.List[object]]::new()
         foreach ($ui in $usableItems) { [void]$items.Add($ui) }
         if ($items.Count -gt 0) {
             $seenFriendly = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            $filtered = foreach ($it in ($items | Sort-Object @{Expression='IsPrimary';Descending=$true}, @{Expression='IsActive';Descending=$true}, @{Expression='Friendly';Descending=$false})) {
-                $key = if ($it.DeviceId) { [string]$it.DeviceId } else { [string]$it.Friendly }
+            $filtered = foreach ($it in ($items | Sort-Object @{Expression='IsPrimary';Descending=$true}, @{Expression='IsActive';Descending=$true}, @{Expression='TargetAvailable';Descending=$true}, @{Expression='Friendly';Descending=$false}, @{Expression='Width';Descending=$true}, @{Expression='Height';Descending=$true})) {
+                $baseName = Get-DisplayBaseName ([string]$it.Friendly)
+                $isGenericName = ($baseName -match '^Display \d+$')
+                $key = if ($it.IsActive -and $it.DeviceId) {
+                    [string]$it.DeviceId
+                } elseif (-not $isGenericName -and $baseName) {
+                    "name:$baseName"
+                } elseif ($it.DeviceId) {
+                    [string]$it.DeviceId
+                } else {
+                    [string]$it.Friendly
+                }
                 if ([string]::IsNullOrWhiteSpace($key)) { continue }
                 if ($seenFriendly.Add($key)) { $it }
             }
@@ -1822,6 +2209,7 @@ function Get-ActiveDisplays {
         Friendly    = "Current primary display"
         IsPrimary   = $true
         IsActive    = $true
+        TargetAvailable = $true
         AdapterLow  = 0
         AdapterHigh = 0
         SourceId    = 0
@@ -2300,8 +2688,9 @@ $STEPS = @(
 $FRL_VALUES = @("30","40","60","90","120","144","165","240","360","Unlimited","Custom...")
 
 # -- Optional tool installers ---------------------------------------------------
-# Missing tools can be installed silently from trusted release URLs, with an
-# official-page fallback kept available beside each installer action.
+# Missing tools can be installed from upstream release URLs after SofaShift shows
+# the SHA256 hash and Authenticode status. Official-page fallbacks are available
+# beside each installer action.
 $TOOL_DOWNLOADS = @{
     NirCmdPath = @{
         Url     = "https://www.nirsoft.net/utils/nircmd-x64.zip"
@@ -2312,7 +2701,7 @@ $TOOL_DOWNLOADS = @{
     PlaynitePath = @{
         Url         = "https://api.github.com/repos/JosefNemec/Playnite/releases/latest"
         Type        = "github-installer"
-        InstallArgs = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
+        AssetRegex  = "^Playnite\d+\.exe$"
         Fallback    = "https://playnite.link/download.html"
     }
     # Optional tools
@@ -2320,13 +2709,13 @@ $TOOL_DOWNLOADS = @{
         Url     = "https://api.github.com/repos/FrogTheFrog/frl-toggle/releases/latest"
         Type    = "github-portable"
         FindExe = "frltoggle.exe"
+        AssetRegex = "^frltoggle-.*x86_64\.exe$"
         Fallback = "https://github.com/FrogTheFrog/frl-toggle/releases"
     }
     HueSyncPath = @{
-        Url         = "https://assets.meethue.com/en/download/app/HueSyncSetup.exe"
+        Url         = "https://firmware.meethue.com/v1/download?deviceTypeId=HueSyncWin"
         Type        = "installer"
-        InstallArgs = "/S"
-        Fallback    = "https://www.philips-hue.com/en-us/entertainment/hue-sync"
+        Fallback    = "https://www.philips-hue.com/en-us/explore-hue/apps"
     }
 }
 
@@ -2363,7 +2752,7 @@ function Stop-PendingDownload ([string]$Key) {
     $script:PendingDownloads.Remove($Key)
 }
 
-function Resolve-DownloadUrl ([string]$Url, [string]$Type) {
+function Resolve-DownloadUrl ([string]$Url, [string]$Type, [string]$AssetRegex = "") {
     if ($Type -in @("zip-extract","installer")) { return $Url }
     try {
         $wc = New-Object System.Net.WebClient
@@ -2372,7 +2761,9 @@ function Resolve-DownloadUrl ([string]$Url, [string]$Type) {
         $wc.Dispose()
         $release = $json | ConvertFrom-Json
         if (-not $release.assets) { Write-DebugLog "  Resolve: no assets in release"; return $null }
-        if ($Type -eq "github-zip") {
+        if ($AssetRegex) {
+            $asset = $release.assets | Where-Object { $_.name -match $AssetRegex } | Select-Object -First 1
+        } elseif ($Type -eq "github-zip") {
             $asset = $release.assets | Where-Object { $_.name -match "\.zip$" -and $_.name -match "(?i)win" } | Select-Object -First 1
             if (-not $asset) { $asset = $release.assets | Where-Object { $_.name -match "\.zip$" } | Select-Object -First 1 }
         } elseif ($Type -eq "github-portable") {
@@ -2387,6 +2778,81 @@ function Resolve-DownloadUrl ([string]$Url, [string]$Type) {
         Write-DebugLog "  Resolve-DownloadUrl failed: $($_.Exception.Message)"
         return $null
     }
+}
+
+function Get-VerifiedDownloadSummary {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $hash = "(unavailable)"
+    try { $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash } catch {}
+
+    $publisher = "(not signed)"
+    $sigStatus = "NotSigned"
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        $sigStatus = [string]$sig.Status
+        if ($sig.SignerCertificate -and $sig.SignerCertificate.Subject) {
+            $publisher = [string]$sig.SignerCertificate.Subject
+        }
+    } catch {}
+
+    [pscustomobject]@{
+        Hash = $hash
+        SignatureStatus = $sigStatus
+        Publisher = $publisher
+    }
+}
+
+function Confirm-DownloadedExecutable {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Label
+    )
+
+    $summary = Get-VerifiedDownloadSummary -Path $Path
+    $msg = "SofaShift downloaded $Label and computed its SHA256 hash for review.`r`n`r`n" +
+           "File: $Path`r`n" +
+           "SHA256: $($summary.Hash)`r`n" +
+           "Signature: $($summary.SignatureStatus)`r`n" +
+           "Publisher: $($summary.Publisher)`r`n`r`n" +
+           "Continue with this file?"
+    $icon = [System.Windows.Forms.MessageBoxIcon]::Information
+    if ($summary.SignatureStatus -ne "Valid") {
+        $msg += "`r`n`r`nWarning: this file is unsigned or its publisher could not be verified."
+        $icon = [System.Windows.Forms.MessageBoxIcon]::Warning
+    }
+    $result = [System.Windows.Forms.MessageBox]::Show(
+        $msg,
+        "Verify $Label",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        $icon
+    )
+    return ($result -eq [System.Windows.Forms.DialogResult]::Yes)
+}
+
+function Test-ZipArchiveSafe {
+    param(
+        [Parameter(Mandatory=$true)][string]$ZipPath,
+        [int64]$MaxEntryBytes = 250MB
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($entry in $zip.Entries) {
+            $name = [string]$entry.FullName
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+            if ([System.IO.Path]::IsPathRooted($name) -or $name -match '(^|[\\/])\.\.([\\/]|$)') {
+                throw "Unsafe archive entry: $name"
+            }
+            if ($entry.Length -gt $MaxEntryBytes) {
+                throw "Archive entry is too large: $name"
+            }
+        }
+    } finally {
+        $zip.Dispose()
+    }
+    return $true
 }
 
 function Start-DownloadJob ([string]$Key, $StatusLbl, $Dot, $PathBox, $Btn, $ProgBar) {
@@ -2409,7 +2875,7 @@ function Start-DownloadJob ([string]$Key, $StatusLbl, $Dot, $PathBox, $Btn, $Pro
     $StatusLbl.ForeColor = $cMuted
     [System.Windows.Forms.Application]::DoEvents()
 
-    $downloadUrl = Resolve-DownloadUrl $cfg.Url $cfg.Type
+    $downloadUrl = Resolve-DownloadUrl $cfg.Url $cfg.Type $cfg.AssetRegex
     if (-not $downloadUrl) {
         $StatusLbl.Text = "  Failed to resolve URL  -  try Official page"
         $StatusLbl.ForeColor = $cErr
@@ -2418,8 +2884,9 @@ function Start-DownloadJob ([string]$Key, $StatusLbl, $Dot, $PathBox, $Btn, $Pro
         return
     }
 
+    if (-not (Test-Path -LiteralPath $extractTo)) { New-Item -ItemType Directory -Path $extractTo -Force | Out-Null }
     $ext = if ($downloadUrl -match "\.zip") { ".zip" } else { ".exe" }
-    $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) ("ss_" + [Guid]::NewGuid().ToString("N") + $ext)
+    $tempFile = Join-Path $extractTo ("ss_download_" + [Guid]::NewGuid().ToString("N") + $ext)
     Write-DebugLog "  tempFile=$tempFile"
     Write-DebugLog "  downloadUrl=$downloadUrl"
 
@@ -2432,7 +2899,6 @@ function Start-DownloadJob ([string]$Key, $StatusLbl, $Dot, $PathBox, $Btn, $Pro
         TempFile = $tempFile
         ExtractTo = $extractTo
         FindExe = $cfg.FindExe
-        InstallArgs = $cfg.InstallArgs
         StatusLbl = $StatusLbl
         PathBox = $PathBox
         Btn = $Btn
@@ -2487,7 +2953,7 @@ function Start-DownloadJob ([string]$Key, $StatusLbl, $Dot, $PathBox, $Btn, $Pro
         $result = ""
         try {
             if ($type -in @("zip-extract","github-zip")) {
-                if (-not (Test-Path $extractTo)) { New-Item -ItemType Directory $extractTo -Force | Out-Null }
+                [void](Test-ZipArchiveSafe -ZipPath $tempFile)
                 try {
                     Add-Type -AssemblyName System.IO.Compression.FileSystem -EA SilentlyContinue
                     [System.IO.Compression.ZipFile]::ExtractToDirectory($tempFile, $extractTo)
@@ -2503,14 +2969,19 @@ function Start-DownloadJob ([string]$Key, $StatusLbl, $Dot, $PathBox, $Btn, $Pro
                     $result = "error:$findExe not found after extraction"
                 }
             } elseif ($type -in @("installer","github-installer")) {
-                $installArgs = $ctx.InstallArgs
-                if ($installArgs) { Start-Process $tempFile -ArgumentList $installArgs -Wait }
-                else { Start-Process $tempFile -Wait }
-                Remove-Item $tempFile -EA SilentlyContinue
-                $result = "ok:"
-                Write-DebugLog "  Installer finished"
+                $label = if ($k) { $k } else { "installer" }
+                if (Confirm-DownloadedExecutable -Path $tempFile -Label $label) {
+                    Start-Process -FilePath $tempFile -Wait
+                    $result = "launched:"
+                    Write-DebugLog "  Installer finished or was closed"
+                } else {
+                    $result = "error:download verified but install was cancelled"
+                }
             } elseif ($type -eq "github-portable") {
-                if (-not (Test-Path $extractTo)) { New-Item -ItemType Directory $extractTo -Force | Out-Null }
+                if (-not (Confirm-DownloadedExecutable -Path $tempFile -Label $findExe)) {
+                    $result = "error:download verified but install was cancelled"
+                    throw $result
+                }
                 $destFile = Join-Path $extractTo $findExe
                 Move-Item $tempFile $destFile -Force
                 $result = if (Test-Path $destFile) { "ok:$destFile" } else { "error:could not place $findExe" }
@@ -2532,6 +3003,13 @@ function Start-DownloadJob ([string]$Key, $StatusLbl, $Dot, $PathBox, $Btn, $Pro
             $ctx.StatusLbl.ForeColor = $cOk
             $ctx.Btn.Enabled = $true; $ctx.Btn.Text = "Installed"
             Write-DebugLog "  Done: success"
+        } elseif ($result -match "^launched:") {
+            Auto-Detect
+            foreach ($row in $script:PrereqRows.Keys) { Update-PrereqRow $row }
+            $ctx.StatusLbl.Text = "  Installer closed  -  Re-scan or Browse if needed"
+            $ctx.StatusLbl.ForeColor = $cWarn
+            $ctx.Btn.Enabled = $true; $ctx.Btn.Text = "Retry"
+            Write-DebugLog "  Done: installer launched; waiting for detection"
         } else {
             $msg = $result -replace "^error:",""; if (-not $msg) { $msg = "Unknown error" }
             $ctx.StatusLbl.Text = "  Failed: $msg"
@@ -3404,7 +3882,7 @@ function Import-ExistingConfig {
                         TargetId      = if ($cp.TargetId)    { [uint32]$cp.TargetId }    else { [uint32]0 }
                         DevicePath    = if ($cp.DevicePath)  { [string]$cp.DevicePath }  else { '' }
                         Friendly      = if ($cp.Friendly)    { [string]$cp.Friendly }    else { [string]$name }
-                        TargetDisplay = if ($cp.Friendly)    { [string]$cp.Friendly }    else { '' }
+                        TargetDisplay = if ($cp.ContainsKey('TargetDisplay') -and $cp.TargetDisplay) { [string]$cp.TargetDisplay } elseif ($cp.Friendly) { [string]$cp.Friendly } else { '' }
                         NativeSaved   = ($cp.TargetId -and [uint32]$cp.TargetId -gt 0)
                         UsePlaynite   = if ($cp.ContainsKey('UsePlaynite'))  { [bool]$cp.UsePlaynite }  else { $true }
                         UseHueSync    = if ($cp.ContainsKey('UseHueSync'))   { [bool]$cp.UseHueSync }   else { $true }
@@ -3763,6 +4241,7 @@ function Export-Config ([string]$OutPath) {
         $profileParts.Add("            TargetId = $([uint32]$pr.TargetId)")
         $profileParts.Add("            DevicePath = $(& $lit $pr.DevicePath)")
         $profileParts.Add("            Friendly = $(& $lit $pr.Friendly)")
+        $profileParts.Add("            TargetDisplay = $(& $lit $pr.TargetDisplay)")
         $profileParts.Add("            UsePlaynite = $(& $boolLit $usePlaynite)")
         $profileParts.Add("            UseHueSync = $(& $boolLit $useHueSync)")
         $profileParts.Add("            UseCustomApp = $(& $boolLit $anyCustomAppEnabled)")
@@ -4011,9 +4490,9 @@ $TrayLauncher  = Join-Path $AppDir "launch_monitorswitcher_hidden.vbs"
 
 Write-UninstallLog "Starting SofaShift uninstall from $AppDir"
 
-# The startup task runs with RunLevel Highest so FRL Toggle can write driver settings.
-# Removing that task may require elevation; relaunch once with UAC, then continue
-# best-effort if the user cancels the prompt.
+# Older SofaShift builds may have registered an elevated startup task. Removing that
+# task can require elevation; relaunch once with UAC, then continue best-effort if
+# the user cancels the prompt.
 if (-not $Elevated -and -not (Test-UninstallAdmin)) {
     try {
         $self = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
@@ -4696,7 +5175,14 @@ function Build-ProfileGroup ([System.Windows.Forms.Panel]$Parent, [int]$Idx, [in
     Write-DebugLog "Build-ProfileGroup[$Idx]: displayItems count = $(@($displayItems).Count)"
     $displayLabels  = @($displayItems | ForEach-Object { $_.Label })
     if (-not $displayLabels -or $displayLabels.Count -eq 0) { $displayLabels = @("Current primary display") }
-    $displayDefault = $prof.TargetDisplay
+    $savedLiveDisplay = $null
+    if ($hasNative) {
+        $savedLiveDisplay = Get-MatchingDisplayForProfile -Profile $prof -DisplayItems $displayItems
+        if ($savedLiveDisplay) {
+            Write-DebugLog "Build-ProfileGroup[$Idx]: saved display identity is present as '$($savedLiveDisplay.Label)' targetId=$($savedLiveDisplay.TargetId)"
+        }
+    }
+    $displayDefault = if ($savedLiveDisplay) { [string]$savedLiveDisplay.Label } else { $prof.TargetDisplay }
     if (-not $displayDefault -and $hasNative -and $prof.Friendly) {
         $displayDefault = [string]$prof.Friendly
     }
@@ -4711,10 +5197,12 @@ function Build-ProfileGroup ([System.Windows.Forms.Panel]$Parent, [int]$Idx, [in
         if (-not $displayDefault) { $displayDefault = "Current primary display" }
     }
     $savedTargetUnavailable = $false
-    if ($hasNative -and $displayDefault -and ($displayLabels -notcontains $displayDefault)) {
-        $displayLabels = @($displayLabels) + @($displayDefault)
+    if ($hasNative -and -not $savedLiveDisplay -and $displayDefault -and ($displayLabels -notcontains $displayDefault)) {
+        $savedUnavailableLabel = "Saved target unavailable: $displayDefault"
+        $displayLabels = @($displayLabels) + @($savedUnavailableLabel)
+        $displayDefault = $savedUnavailableLabel
         $savedTargetUnavailable = $true
-        Write-DebugLog "Build-ProfileGroup[$Idx]: saved target '$displayDefault' is not in the live display list"
+        Write-DebugLog "Build-ProfileGroup[$Idx]: saved target '$($prof.Friendly)' is not in the live display list"
     }
     $displayCombo = New-CB 184 78 446 $displayLabels $displayDefault
     $displayCombo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
@@ -5074,6 +5562,25 @@ function Build-ProfileGroup ([System.Windows.Forms.Panel]$Parent, [int]$Idx, [in
             if (-not $localW -or -not $localW.Profiles -or $Idx -ge $localW.Profiles.Count) {
                 throw "Profile backing store is not available. Try navigating back to this page and trying again."
             }
+            $existingProfile = $localW.Profiles[$Idx]
+            $existingDevicePath = [string](Get-ProfileValue $existingProfile 'DevicePath' '')
+            $selectedDevicePath = [string]$selectedDisplay.DeviceId
+            if ((Test-ProfileHasNativeTarget $existingProfile) -and
+                -not [string]::IsNullOrWhiteSpace($existingDevicePath) -and
+                -not [string]::IsNullOrWhiteSpace($selectedDevicePath) -and
+                $existingDevicePath.Trim() -ine $selectedDevicePath.Trim()) {
+                $replace = [System.Windows.Forms.MessageBox]::Show(
+                    "This profile is already saved for a different physical display.`n`nChoose Yes only if you want to replace that saved display binding with the currently selected display. To keep both displays, choose No and use Add profile for the second display.",
+                    "Replace saved display binding?",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning,
+                    [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+                if ($replace -ne [System.Windows.Forms.DialogResult]::Yes) {
+                    $saveStatus.Text = "  Saved profile was not changed"
+                    $saveStatus.ForeColor = $cMuted
+                    return
+                }
+            }
             $localW.Profiles[$Idx].Name        = $pName
             $localW.Profiles[$Idx].AdapterLow  = [uint32]$selectedDisplay.AdapterLow
             $localW.Profiles[$Idx].AdapterHigh = [int]$selectedDisplay.AdapterHigh
@@ -5201,6 +5708,7 @@ function Build-P2 {
                     Friendly    = "Current primary display"
                     IsPrimary   = $true
                     IsActive    = $true
+                    TargetAvailable = $true
                     AdapterLow  = 0
                     AdapterHigh = 0
                     SourceId    = 0
@@ -5957,7 +6465,7 @@ function Build-P5 {
                 $regPath = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SofaShift'
                 if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
                 New-ItemProperty -Path $regPath -Name 'DisplayName'     -Value 'SofaShift' -PropertyType String -Force | Out-Null
-                New-ItemProperty -Path $regPath -Name 'DisplayVersion'  -Value '0.1.0'    -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $regPath -Name 'DisplayVersion'  -Value '1.0.1'    -PropertyType String -Force | Out-Null
                 New-ItemProperty -Path $regPath -Name 'Publisher'       -Value 'SofaShift' -PropertyType String -Force | Out-Null
                 New-ItemProperty -Path $regPath -Name 'InstallLocation' -Value $appDir    -PropertyType String -Force | Out-Null
                 New-ItemProperty -Path $regPath -Name 'UninstallString' -Value "`"$uninstCmd`"" -PropertyType String -Force | Out-Null
@@ -5996,35 +6504,15 @@ function Build-P5 {
                         $taskUser  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
                         $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
                         $settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -StartWhenAvailable
-                        # Match the stable V2 runtime: run the watcher elevated so FRL Toggle can
-                        # apply driver settings. User-facing apps launch through explorer.exe.
                         $watchAction = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$watchLauncher`""
-                        $registeredElevated = $false
-                        try {
-                            $principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Highest
-                            Register-ScheduledTask -TaskName "SofaShift Monitor" `
-                                -Action $watchAction -Trigger $trigger -Settings $settings -Principal $principal `
-                                -Description "SofaShift controller watcher  -  auto-starts hidden on login" `
-                                -Force -ErrorAction Stop | Out-Null
-                            $registeredElevated = $true
-                            Write-DebugLog "Startup task: registered elevated hidden watcher with wscript.exe '$watchLauncher'"
-                        } catch {
-                            Write-DebugLog "Startup task: elevated registration failed: $($_.Exception.Message)"
-                            $principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive
-                            Register-ScheduledTask -TaskName "SofaShift Monitor" `
-                                -Action $watchAction -Trigger $trigger -Settings $settings -Principal $principal `
-                                -Description "SofaShift controller watcher  -  auto-starts hidden on login" `
-                                -Force -ErrorAction Stop | Out-Null
-                            Write-DebugLog "Startup task: registered non-elevated fallback hidden watcher with wscript.exe '$watchLauncher'"
-                        }
-
-                        if ($registeredElevated) {
-                            $taskStatusLbl.Text      = "$([char]0x2713)  Startup registered  -  controller_watch.ps1 will launch hidden at login"
-                            $taskStatusLbl.ForeColor = $cOk
-                        } else {
-                            $taskStatusLbl.Text      = "$([char]0x2713)  Startup registered without elevation  -  display switching works; FRL may need admin"
-                            $taskStatusLbl.ForeColor = $cWarn
-                        }
+                        $principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive
+                        Register-ScheduledTask -TaskName "SofaShift Monitor" `
+                            -Action $watchAction -Trigger $trigger -Settings $settings -Principal $principal `
+                            -Description "SofaShift controller watcher  -  auto-starts hidden on login" `
+                            -Force -ErrorAction Stop | Out-Null
+                        Write-DebugLog "Startup task: registered unelevated hidden watcher with wscript.exe '$watchLauncher'"
+                        $taskStatusLbl.Text      = "$([char]0x2713)  Startup registered without elevation  -  display switching works; FRL may need admin"
+                        $taskStatusLbl.ForeColor = $cWarn
                     } catch {
                         $taskStatusLbl.Text      = "Task registration failed: $($_.Exception.Message)"
                         $taskStatusLbl.ForeColor = $cErr
